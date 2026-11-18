@@ -49,8 +49,8 @@ archivos = cliente.descargar_propuesta("ventas", "202410", destino="descargas", 
 | Paso | Servicio |
 |------|----------|
 | Token | `POST https://api-seguridad.sunat.gob.pe/v1/clientessol/{client_id}/oauth2/token/` (`grant_type=password`, `username = RUC + usuario SOL`) |
-| Propuesta ventas | `GET …/libros/rvie/propuesta/web/propuesta/{AAAAMM}/exportapropuesta?codTipoArchivo=0\|1` |
-| Propuesta compras | `GET …/libros/rce/propuesta/web/propuesta/{AAAAMM}/exportacioncomprobantepropuesta?codTipoArchivo=0\|1&codOrigenEnvio=2` |
+| Propuesta ventas | `GET …/libros/rvie/propuesta/web/propuesta/{AAAAMM}/exportapropuesta?codTipoArchivo={0..2}` |
+| Propuesta compras | `GET …/libros/rce/propuesta/web/propuesta/{AAAAMM}/exportacioncomprobantepropuesta?codTipoArchivo={0..2}&codOrigenEnvio=2` |
 | Estado del ticket | `GET …/libros/rvierce/gestionprocesosmasivos/web/masivo/consultaestadotickets` (en ventas además `codLibro=140000&codOrigenEnvio=2`) |
 | Descarga | `GET …/libros/rvierce/gestionprocesosmasivos/web/masivo/archivoreporte` |
 
