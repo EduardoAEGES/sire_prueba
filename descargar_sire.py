@@ -7,7 +7,6 @@ Uso:
 """
 
 import argparse
-import json
 import logging
 import os
 import sys
@@ -36,7 +35,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description="Descarga registros de compras/ventas desde SUNAT SIRE")
     p.add_argument("periodo", nargs="?", help="Periodo tributario AAAAMM, p. ej. 202410")
     p.add_argument("--libro", choices=["ventas", "compras", "ambos"], default="ambos")
-    p.add_argument("--formato", choices=["txt", "csv"], default="txt")
+    p.add_argument("--formato", choices=["txt", "csv", "excel"], default="txt")
     p.add_argument("--destino", default="descargas")
     p.add_argument("--periodos", choices=["ventas", "compras"], help="Solo listar periodos disponibles")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -49,18 +48,28 @@ def main() -> None:
     try:
         if args.periodos:
             cod = LIBRO_VENTAS if args.periodos == "ventas" else LIBRO_COMPRAS
-            print(json.dumps(cliente.periodos(cod), indent=2, ensure_ascii=False))
+            for ejercicio in cliente.periodos(cod):
+                print(f"{ejercicio.get('numEjercicio')} ({ejercicio.get('desEstado', '')})")
+                for per in ejercicio.get("lisPeriodos") or []:
+                    print(f"  {per.get('perTributario')}  {per.get('desEstado', '')}")
             return
         if not args.periodo:
             p.error("indique el periodo (AAAAMM) o use --periodos")
 
-        libros = ["ventas", "compras"] if args.libro == "ambos" else [args.libro]
-        for libro in libros:
-            print(f"Descargando {libro} {args.periodo}...")
-            for ruta in cliente.descargar_propuesta(libro, args.periodo, args.destino, args.formato):
-                print(f"  -> {ruta}")
     except (SireError, ValueError) as e:
         sys.exit(f"Error: {e}")
+
+    libros = ["ventas", "compras"] if args.libro == "ambos" else [args.libro]
+    fallos = 0
+    for libro in libros:
+        print(f"Descargando {libro} {args.periodo}...")
+        try:
+            for ruta in cliente.descargar_propuesta(libro, args.periodo, args.destino, args.formato):
+                print(f"  -> {ruta}")
+        except (SireError, ValueError) as e:
+            fallos += 1
+            print(f"  Error: {e}", file=sys.stderr)
+    sys.exit(1 if fallos else 0)
 
 
 if __name__ == "__main__":

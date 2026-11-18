@@ -6,9 +6,12 @@ Flujo de descarga de la propuesta de un periodo:
     3. Consultar el estado del ticket hasta que esté "Terminado"
     4. Descargar el archivo de reporte (ZIP con TXT o CSV) y descomprimirlo
 
-Las rutas siguen el "Manual de Servicios Web API SIRE" (Compras y Ventas). Si SUNAT
-cambia alguna ruta en una versión nueva del manual, basta con ajustar las constantes
-de este módulo.
+Rutas y parámetros verificados contra:
+  - Manual de servicios Web API SIRE Compras v22 (5.1, 5.31, 5.32, 5.33, 5.34)
+  - Manual del servicio API del Registro de Ventas e Información Electrónica v30
+    (5.1, 5.2, 5.16, 5.17, 5.18)
+Si SUNAT cambia alguna ruta en una versión nueva del manual, basta con ajustar las
+constantes de este módulo.
 """
 
 from __future__ import annotations
@@ -37,8 +40,18 @@ RUTA_PROPUESTA_COMPRAS = "/rce/propuesta/web/propuesta/{periodo}/exportacioncomp
 RUTA_ESTADO_TICKET = "/rvierce/gestionprocesosmasivos/web/masivo/consultaestadotickets"
 RUTA_DESCARGA = "/rvierce/gestionprocesosmasivos/web/masivo/archivoreporte"
 
-TIPO_ARCHIVO = {"txt": "0", "csv": "1"}
-ESTADO_TERMINADO = "06"
+# codTipoArchivo: los manuales usan códigos distintos según el libro
+#   Compras (Anexo III): 0 txt, 1 csv, 2 excel
+#   Ventas  (Anexo IV):  0 txt, 1 excel, 2 csv
+TIPO_ARCHIVO = {
+    "compras": {"txt": "0", "csv": "1", "excel": "2"},
+    "ventas": {"txt": "0", "excel": "1", "csv": "2"},
+}
+CODIGO_ORIGEN_API = "2"  # codOrigenEnvio: 2 = Servicio Web API
+
+# Códigos de estado de envío del ticket (Anexo III del manual de Ventas)
+ESTADOS_OK = {"04", "06"}  # 04 Procesado sin errores, 06 Terminado
+ESTADOS_ERROR = {"03"}  # 03 Procesado con errores
 
 
 class SireError(Exception):
@@ -95,26 +108,32 @@ class SireClient:
             timeout=self.timeout,
         )
         if r.status_code != 200:
-            raise SireError(f"GET {ruta} -> {r.status_code}: {r.text}")
+            raise SireError(f"GET {ruta} -> {r.status_code}: {_mensaje_error(r)}")
         return r
 
     # --------------------------------------------------------------- consultas
     def periodos(self, cod_libro: str) -> list[dict]:
-        """Lista los ejercicios/periodos disponibles para el libro (140000 ventas, 080000 compras)."""
+        """Lista los ejercicios y periodos habilitados para el libro (140000 ventas, 080000 compras).
+
+        Respuesta: [{"numEjercicio": "2024", "desEstado": ..., "lisPeriodos":
+                     [{"perTributario": "202401", "codEstado": ..., "desEstado": ...}]}]
+        """
         return self._get(RUTA_PERIODOS.format(cod_libro=cod_libro)).json()
 
     def solicitar_propuesta(self, libro: str, periodo: str, formato: str = "txt") -> str:
         """Pide a SUNAT que genere el archivo de la propuesta. Devuelve el número de ticket."""
         _validar_periodo(periodo)
-        cod = TIPO_ARCHIVO[formato]
-        if libro == "ventas":
+        if libro not in TIPO_ARCHIVO:
+            raise ValueError("libro debe ser 'ventas' o 'compras'")
+        if formato not in TIPO_ARCHIVO[libro]:
+            raise ValueError(f"formato debe ser uno de {sorted(TIPO_ARCHIVO[libro])}")
+        cod = TIPO_ARCHIVO[libro][formato]
+        if libro == "ventas":  # Ventas 5.18
             ruta = RUTA_PROPUESTA_VENTAS.format(periodo=periodo)
             params = {"codTipoArchivo": cod}
-        elif libro == "compras":
+        else:  # Compras 5.34
             ruta = RUTA_PROPUESTA_COMPRAS.format(periodo=periodo)
-            params = {"codTipoArchivo": cod, "codOrigenEnvio": "2"}  # 2 = servicio web API
-        else:
-            raise ValueError("libro debe ser 'ventas' o 'compras'")
+            params = {"codTipoArchivo": cod, "codOrigenEnvio": CODIGO_ORIGEN_API}
 
         body = self._get(ruta, params).json()
         ticket = body.get("numTicket") if isinstance(body, dict) else None
@@ -123,26 +142,30 @@ class SireClient:
         log.info("Ticket %s generado para %s %s", ticket, libro, periodo)
         return ticket
 
-    def estado_ticket(self, periodo: str, ticket: str) -> dict:
+    def estado_ticket(self, libro: str, periodo: str, ticket: str) -> dict:
         params = {"perIni": periodo, "perFin": periodo, "page": 1, "perPage": 20, "numTicket": ticket}
+        if libro == "ventas":  # el manual de Ventas (5.16) los marca como obligatorios
+            params.update(codLibro=LIBRO_VENTAS, codOrigenEnvio=CODIGO_ORIGEN_API)
         body = self._get(RUTA_ESTADO_TICKET, params).json()
         for reg in body.get("registros", []):
             if str(reg.get("numTicket")) == str(ticket):
                 return reg
         raise SireError(f"Ticket {ticket} no encontrado en la respuesta: {body}")
 
-    def esperar_ticket(self, periodo: str, ticket: str, intervalo: int = 5, max_espera: int = 600) -> dict:
+    def esperar_ticket(
+        self, libro: str, periodo: str, ticket: str, intervalo: int = 5, max_espera: int = 600
+    ) -> dict:
         """Consulta el ticket hasta que termine. Devuelve el registro del ticket."""
         limite = time.time() + max_espera
         while True:
-            reg = self.estado_ticket(periodo, ticket)
+            reg = self.estado_ticket(libro, periodo, ticket)
             cod = str(reg.get("codEstadoProceso", ""))
             des = str(reg.get("desEstadoProceso", ""))
             log.info("Ticket %s: %s %s", ticket, cod, des)
-            if cod == ESTADO_TERMINADO or des.lower().startswith("terminado"):
+            if cod in ESTADOS_OK and reg.get("archivoReporte"):
                 return reg
-            if "error" in des.lower() or "rechaz" in des.lower():
-                raise SireError(f"El ticket {ticket} terminó con error: {reg}")
+            if cod in ESTADOS_ERROR:
+                raise SireError(f"El ticket {ticket} terminó con errores ({des}): {reg.get('detalleTicket')}")
             if time.time() > limite:
                 raise SireError(f"Tiempo de espera agotado para el ticket {ticket} (último estado: {des})")
             time.sleep(intervalo)
@@ -155,17 +178,18 @@ class SireClient:
         resultado = []
         for arch in archivos:
             nombre = arch.get("nomArchivoReporte")
-            # SUNAT devuelve el campo con la errata "codTipoAchivoReporte"
-            tipo = arch.get("codTipoAchivoReporte") or arch.get("codTipoArchivoReporte")
+            # SUNAT devuelve el campo con la errata "codTipoAchivoReporte". Si viene null,
+            # el manual indica enviar el mismo valor: el texto "null".
+            tipo = arch.get("codTipoAchivoReporte", arch.get("codTipoArchivoReporte"))
             params = {
                 "nomArchivoReporte": nombre,
-                "codTipoArchivoReporte": tipo,
+                "codTipoArchivoReporte": "null" if tipo is None else tipo,
+                # Ventas 5.17 exige además estos campos; Compras 5.32 solo los dos primeros
                 "codLibro": cod_libro,
                 "perTributario": reg_ticket.get("perTributario"),
                 "codProceso": reg_ticket.get("codProceso"),
                 "numTicket": reg_ticket.get("numTicket"),
             }
-            params = {k: v for k, v in params.items() if v not in (None, "")}
             r = self._get(RUTA_DESCARGA, params)
             resultado.append((nombre, r.content))
         return resultado
@@ -177,7 +201,7 @@ class SireClient:
         """Flujo completo: solicita, espera y descarga la propuesta. Devuelve las rutas extraídas."""
         cod_libro = LIBRO_VENTAS if libro == "ventas" else LIBRO_COMPRAS
         ticket = self.solicitar_propuesta(libro, periodo, formato)
-        reg = self.esperar_ticket(periodo, ticket)
+        reg = self.esperar_ticket(libro, periodo, ticket)
 
         carpeta = Path(destino) / libro / periodo
         carpeta.mkdir(parents=True, exist_ok=True)
@@ -194,6 +218,18 @@ class SireClient:
                 ruta.write_bytes(contenido)
                 guardados.append(ruta)
         return guardados
+
+
+def _mensaje_error(r: requests.Response) -> str:
+    """Convierte la respuesta de error de SUNAT ({"cod","msg","errors":[...]}) en texto legible."""
+    try:
+        body = r.json()
+    except ValueError:
+        return r.text
+    if not isinstance(body, dict):
+        return r.text
+    errores = "; ".join(f"[{e.get('cod')}] {e.get('msg')}" for e in body.get("errors") or [])
+    return f"{body.get('msg', '')} {errores}".strip() or r.text
 
 
 def _validar_periodo(periodo: str) -> None:

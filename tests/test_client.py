@@ -5,7 +5,7 @@ import zipfile
 
 import pytest
 
-from sire import Credenciales, SireClient
+from sire import Credenciales, SireClient, SireError
 from sire.client import _validar_periodo
 
 
@@ -51,7 +51,7 @@ class SesionFalsa:
                 "codEstadoProceso": "06" if terminado else "02",
                 "desEstadoProceso": "Terminado" if terminado else "En proceso",
                 "archivoReporte": [{"nomArchivoReporte": "LE2010_compras.zip",
-                                    "codTipoAchivoReporte": "00"}] if terminado else [],
+                                    "codTipoAchivoReporte": None}] if terminado else [],
             }]})
         if url.endswith("archivoreporte"):
             return Resp(content=zip_con("LE2010_compras.txt", "linea1\nlinea2\n"))
@@ -71,7 +71,10 @@ def test_descarga_compras(tmp_path, monkeypatch):
     assert url_token == "https://api-seguridad.sunat.gob.pe/v1/clientessol/cid/oauth2/token/"
     assert data["username"] == "20123456789USR"
     descarga = [c for c in sesion.llamadas if c[1].endswith("archivoreporte")][0][2]
-    assert descarga["codTipoArchivoReporte"] == "00" and descarga["codLibro"] == "080000"
+    # codTipoAchivoReporte null -> se envía el texto "null" (nota del manual 5.32)
+    assert descarga["codTipoArchivoReporte"] == "null" and descarga["codLibro"] == "080000"
+    propuesta = [c for c in sesion.llamadas if c[1].endswith("exportacioncomprobantepropuesta")][0][2]
+    assert propuesta == {"codTipoArchivo": "0", "codOrigenEnvio": "2"}
     # el token se reutiliza: un solo POST
     assert sum(1 for c in sesion.llamadas if c[0] == "POST") == 1
 
@@ -80,3 +83,33 @@ def test_descarga_compras(tmp_path, monkeypatch):
 def test_periodo_invalido(periodo):
     with pytest.raises(ValueError):
         _validar_periodo(periodo)
+
+
+def test_formato_csv_difiere_por_libro():
+    sesion = SesionFalsa()
+    cliente = SireClient(Credenciales("20123456789", "USR", "c", "cid", "cs"), session=sesion)
+    cliente.solicitar_propuesta("compras", "202410", "csv")
+    assert sesion.llamadas[-1][2]["codTipoArchivo"] == "1"  # compras: 1 = csv
+
+
+def test_ticket_con_errores(monkeypatch):
+    class Sesion(SesionFalsa):
+        def get(self, url, params, headers, timeout):
+            self.llamadas.append(("GET", url, params))
+            return Resp(json_data={"registros": [{"numTicket": "T1", "codEstadoProceso": "03",
+                                                  "desEstadoProceso": "Procesado con Errores"}]})
+    sesion = Sesion()
+    cliente = SireClient(Credenciales("20123456789", "USR", "c", "cid", "cs"), session=sesion)
+    with pytest.raises(SireError, match="errores"):
+        cliente.esperar_ticket("ventas", "202410", "T1")
+    assert sesion.llamadas[-1][2]["codLibro"] == "140000"
+
+
+def test_mensaje_error_422():
+    class Sesion(SesionFalsa):
+        def get(self, url, params, headers, timeout):
+            return Resp(422, json_data={"cod": "422", "msg": "Unprocessable Entity", "errors": [
+                {"cod": "1070", "msg": "No se ha encontrado información de comprobantes"}]})
+    cliente = SireClient(Credenciales("20123456789", "USR", "c", "cid", "cs"), session=Sesion())
+    with pytest.raises(SireError, match=r"\[1070\] No se ha encontrado"):
+        cliente.solicitar_propuesta("ventas", "202410")
